@@ -49,6 +49,9 @@ type PluginConf struct {
 
 	// Add plugin-specific flags here
 	Table *int `json:"table,omitempty"`
+	// Gateway allows specifying a static/hardcoded gateway IP address
+	// If set, this will be used instead of the gateway from prevResult
+	Gateway string `json:"gateway,omitempty"`
 }
 
 // Wrapper that does a lock before and unlock after operations to serialise
@@ -168,7 +171,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		if conf.Table != nil {
 			return doRoutesWithTable(ipCfgs, *conf.Table)
 		}
-		return doRoutes(ipCfgs, args.IfName)
+		return doRoutes(ipCfgs, args.IfName, conf.Gateway)
 	})
 	if err != nil {
 		return err
@@ -207,7 +210,7 @@ func getNextTableID(rules []netlink.Rule, routes []netlink.Route, candidateID in
 }
 
 // doRoutes does all the work to set up routes and rules during an add.
-func doRoutes(ipCfgs []*current.IPConfig, iface string) error {
+func doRoutes(ipCfgs []*current.IPConfig, iface string, staticGateway string) error {
 	// Get a list of rules and routes ready.
 	rules, err := netlinksafe.RuleList(netlink.FAMILY_ALL)
 	if err != nil {
@@ -238,6 +241,16 @@ func doRoutes(ipCfgs []*current.IPConfig, iface string) error {
 		return fmt.Errorf("Unable to list routes: %v", err)
 	}
 
+	// Parse static gateway if provided
+	var staticGw net.IP
+	if staticGateway != "" {
+		staticGw = net.ParseIP(staticGateway)
+		if staticGw == nil {
+			return fmt.Errorf("Invalid static gateway IP address: %s", staticGateway)
+		}
+		log.Printf("Using static gateway: %s", staticGw.String())
+	}
+
 	// Loop through setting up source based rules and default routes.
 	for _, ipCfg := range ipCfgs {
 		log.Printf("Set rule for source %s", ipCfg.String())
@@ -260,10 +273,18 @@ func doRoutes(ipCfgs []*current.IPConfig, iface string) error {
 			return fmt.Errorf("Failed to add rule: %v", err)
 		}
 
+		// Determine which gateway to use: static gateway takes precedence
+		var gateway net.IP
+		if staticGw != nil {
+			gateway = staticGw
+		} else if ipCfg.Gateway != nil {
+			gateway = ipCfg.Gateway
+		}
+
 		// Add a default route, since this may have been removed by previous
 		// plugin.
-		if ipCfg.Gateway != nil {
-			log.Printf("Adding default route to gateway %s", ipCfg.Gateway.String())
+		if gateway != nil {
+			log.Printf("Adding default route to gateway %s", gateway.String())
 
 			var dest net.IPNet
 			if ipCfg.Address.IP.To4() != nil {
@@ -276,7 +297,7 @@ func doRoutes(ipCfgs []*current.IPConfig, iface string) error {
 
 			route := netlink.Route{
 				Dst:       &dest,
-				Gw:        ipCfg.Gateway,
+				Gw:        gateway,
 				Table:     table,
 				LinkIndex: linkIndex,
 			}
@@ -284,7 +305,7 @@ func doRoutes(ipCfgs []*current.IPConfig, iface string) error {
 			err = netlink.RouteAdd(&route)
 			if err != nil {
 				return fmt.Errorf("Failed to add default route to %s: %v",
-					ipCfg.Gateway.String(),
+					gateway.String(),
 					err)
 			}
 		}
